@@ -17,7 +17,7 @@ static DEFINE_IDA(rng_index_ida);
 
 struct virtrng_info {
 	struct hwrng hwrng;
-	struct virtqueue *vq;
+	struct virtqueue *request_vq;
 	struct completion have_data;
 	char name[25];
 	unsigned int data_avail;
@@ -32,7 +32,7 @@ static void random_recv_done(struct virtqueue *vq)
 	struct virtrng_info *vi = vq->vdev->priv;
 
 	/* We can get spurious callbacks, e.g. shared IRQs + virtio_pci. */
-	if (!virtqueue_get_buf(vi->vq, &vi->data_avail))
+	if (!virtqueue_get_buf(vi->request_vq, &vi->data_avail))
 		return;
 
 	complete(&vi->have_data);
@@ -46,9 +46,9 @@ static void register_buffer(struct virtrng_info *vi, u8 *buf, size_t size)
 	sg_init_one(&sg, buf, size);
 
 	/* There should always be room for one buffer. */
-	virtqueue_add_inbuf(vi->vq, &sg, 1, buf, GFP_KERNEL);
+	virtqueue_add_inbuf(vi->request_vq, &sg, 1, buf, GFP_KERNEL);
 
-	virtqueue_kick(vi->vq);
+	virtqueue_kick(vi->request_vq);
 }
 
 static int virtio_read(struct hwrng *rng, void *buf, size_t size, bool wait)
@@ -112,9 +112,9 @@ static int probe_common(struct virtio_device *vdev)
 	vdev->priv = vi;
 
 	/* We expect a single virtqueue. */
-	vi->vq = virtio_find_single_vq(vdev, random_recv_done, "input");
-	if (IS_ERR(vi->vq)) {
-		err = PTR_ERR(vi->vq);
+	vi->request_vq = virtio_find_single_vq(vdev, random_recv_done, "input");
+	if (IS_ERR(vi->request_vq)) {
+		err = PTR_ERR(vi->request_vq);
 		goto err_find;
 	}
 
