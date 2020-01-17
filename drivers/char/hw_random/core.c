@@ -105,6 +105,15 @@ static void drop_current_rng(void)
 	if (!current_rng)
 		return;
 
+	/* ask the backend to abort the current read
+	 * This allows to release the reading_mutex and to decrease
+	 * the current_rng kref
+	 * This is needed to be able to trigger the cleanup callback
+	 * and to be able to read from the new rng
+	 */
+	if (current_rng->flush)
+		current_rng->flush(current_rng);
+
 	/* decrease last reference for triggering the cleanup */
 	kref_put(&current_rng->ref, cleanup_rng);
 	current_rng = NULL;
