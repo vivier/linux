@@ -15,10 +15,17 @@
 
 static DEFINE_IDA(rng_index_ida);
 
+struct control_buf {
+	struct virtio_rng_ctrl_hdr hdr;
+	virtio_rng_ctrl_ack status;
+};
+
 struct virtrng_info {
 	struct hwrng hwrng;
 	struct virtqueue *request_vq;
+	struct virtqueue *ctrl_vq;
 	struct completion have_data;
+	struct control_buf *ctrl;
 	char name[25];
 	unsigned int data_avail;
 	int index;
@@ -77,12 +84,51 @@ static int virtio_read(struct hwrng *rng, void *buf, size_t size, bool wait)
 	return vi->data_avail;
 }
 
+static bool virtio_rng_send_cmd(struct virtrng_info *vi, u8 cmd)
+{
+	struct scatterlist *sgs[2], hdr, stat;
+	unsigned int out_num = 0, tmp;
+
+	if (!vi->ctrl_vq)
+		return false;
+
+	vi->ctrl->status = ~0;
+	vi->ctrl->hdr.cmd = cmd;
+
+	/* Add header */
+	sg_init_one(&hdr, &vi->ctrl->hdr, sizeof(vi->ctrl->hdr));
+	sgs[out_num++] = &hdr;
+
+	/* Add return status. */
+	sg_init_one(&stat, &vi->ctrl->status, sizeof(vi->ctrl->status));
+	sgs[out_num] = &stat;
+
+	virtqueue_add_sgs(vi->ctrl_vq, sgs, out_num, 1, vi, GFP_ATOMIC);
+
+	if (unlikely(!virtqueue_kick(vi->ctrl_vq)))
+		return vi->ctrl->status == VIRTIO_RNG_OK;
+
+	while (!virtqueue_get_buf(vi->ctrl_vq, &tmp) &&
+	       !virtqueue_is_broken(vi->ctrl_vq))
+		cpu_relax();
+
+	return vi->ctrl->status == VIRTIO_RNG_OK;
+}
+
 static void virtio_cleanup(struct hwrng *rng)
 {
 	struct virtrng_info *vi = (struct virtrng_info *)rng->priv;
 
 	if (vi->busy)
 		wait_for_completion(&vi->have_data);
+}
+
+static void virtio_flush(struct hwrng *rng)
+{
+	struct virtrng_info *vi = (struct virtrng_info *)rng->priv;
+
+	if (vi->busy)
+		virtio_rng_send_cmd(vi, VIRTIO_RNG_CMD_FLUSH);
 }
 
 static int probe_common(struct virtio_device *vdev)
@@ -105,17 +151,42 @@ static int probe_common(struct virtio_device *vdev)
 	vi->hwrng = (struct hwrng) {
 		.read = virtio_read,
 		.cleanup = virtio_cleanup,
+		.flush = virtio_flush,
 		.priv = (unsigned long)vi,
 		.name = vi->name,
 		.quality = 1000,
 	};
 	vdev->priv = vi;
 
-	/* We expect a single virtqueue. */
-	vi->request_vq = virtio_find_single_vq(vdev, random_recv_done, "input");
-	if (IS_ERR(vi->request_vq)) {
-		err = PTR_ERR(vi->request_vq);
-		goto err_find;
+	if (virtio_has_feature(vdev, VIRTIO_RNG_F_CTRL_VQ)) {
+		struct virtqueue *vqs[2];
+		vq_callback_t *cbs[] = { random_recv_done,
+					 NULL };
+		static const char * const names[] = { "input", "ctrl" };
+
+		vi->ctrl = kzalloc(sizeof(*vi->ctrl), GFP_KERNEL);
+		if (!vi->ctrl) {
+			err = -ENOMEM;
+			goto err_find;
+		}
+
+		err = virtio_find_vqs(vdev, 2, vqs, cbs, names, NULL);
+		if (err) {
+			kfree(vi->ctrl);
+			goto err_find;
+		}
+		vi->request_vq = vqs[0];
+		vi->ctrl_vq = vqs[1];
+	} else {
+		/* We expect a single virtqueue. */
+		vi->ctrl_vq = NULL;
+		vi->ctrl = NULL;
+		vi->request_vq = virtio_find_single_vq(vdev, random_recv_done,
+						       "input");
+		if (IS_ERR(vi->request_vq)) {
+			err = PTR_ERR(vi->request_vq);
+			goto err_find;
+		}
 	}
 
 	return 0;
@@ -140,6 +211,7 @@ static void remove_common(struct virtio_device *vdev)
 		hwrng_unregister(&vi->hwrng);
 	vdev->config->del_vqs(vdev);
 	ida_simple_remove(&rng_index_ida, vi->index);
+	kfree(vi->ctrl);
 	kfree(vi);
 }
 
@@ -200,7 +272,13 @@ static struct virtio_device_id id_table[] = {
 	{ 0 },
 };
 
+static unsigned int features[] = {
+	VIRTIO_RNG_F_CTRL_VQ,
+};
+
 static struct virtio_driver virtio_rng_driver = {
+	.feature_table = features,
+	.feature_table_size = ARRAY_SIZE(features),
 	.driver.name =	KBUILD_MODNAME,
 	.driver.owner =	THIS_MODULE,
 	.id_table =	id_table,
