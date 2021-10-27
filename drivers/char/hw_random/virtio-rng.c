@@ -52,6 +52,8 @@ static void request_entropy(struct virtrng_info *vi)
 	struct scatterlist sg;
 
 	reinit_completion(&vi->have_data);
+	vi->data_avail = 0;
+	vi->data_idx = 0;
 
 	sg_init_one(&sg, vi->data, sizeof(vi->data));
 
